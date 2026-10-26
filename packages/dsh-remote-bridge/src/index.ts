@@ -16,8 +16,11 @@
  * - `user-questions/request` is claimed the same way and published as
  *   `question.request` to the devices that declared `questions.v1`; their
  *   `question.answer` settles the host's own ask while it is open, or reaches a
- *   continued question through the host's Remote `answer`. Every other case
- *   delegates, and the question keeps the Host's own deadline.
+ *   continued question through the host's Remote `answer`. With no paired
+ *   connection on the wire the claim is still made when a roster device registered
+ *   for notifications, which is reached by the alert and holds the question for one
+ *   window before it goes back to the host's chain (§11.3, §32). Every other case
+ *   delegates, and a timed question keeps the Host's own deadline.
  *
  * The browser half lives in `src/client/` and is declared by `dsh.client`: one
  * sidebar-foot panel that reads the same loopback-gated token route over a
@@ -40,7 +43,7 @@ import type { ConnectionAuth } from './core/connection.ts'
 import { DeviceRoster } from './core/devices.ts'
 import { createRemoteBridgeFace, RemoteBridgeRegistry, REMOTE_BRIDGE_SERVICE } from './core/extension.ts'
 import { JobRoster, type JobRegistryFace } from './core/jobs.ts'
-import { BridgeHub } from './core/hub.ts'
+import { BridgeHub, OFFLINE_QUESTION_CLAIM_TTL_MS } from './core/hub.ts'
 import { createOwnerPeer } from './core/owner-peer.ts'
 import { PairingService } from './core/pairing.ts'
 import { LiveActivityNotifier } from './core/liveactivity.ts'
@@ -70,6 +73,24 @@ export const inject = ['typertGateway', 'webServer']
 
 /** Where the paired-device roster lives inside the DSH home. */
 export const ROSTER_PATH = 'remote-bridge/devices.json'
+
+/** The environment variable that moves the offline claim window (§32.2). */
+export const OFFLINE_CLAIM_TTL_ENV = 'DSH_REMOTE_BRIDGE_OFFLINE_CLAIM_TTL_MS'
+
+/**
+ * The offline claim window this process runs with.
+ *
+ * The window is the bridge's own constant and never a host fact, so a deployment
+ * moves it here. A value that is missing, unreadable or not positive falls back to
+ * the constant instead of closing the window: a zero window would silently switch
+ * the channel off, and an operator who wanted that would be turning off push.
+ * @param env - the process environment, injectable for a suite.
+ * @returns the window in milliseconds.
+ */
+export function offlineClaimTtl(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number(env[OFFLINE_CLAIM_TTL_ENV])
+  return Number.isFinite(configured) && configured > 0 ? configured : OFFLINE_QUESTION_CLAIM_TTL_MS
+}
 
 /** This machine's IANA time zone, or undefined when the platform has none. */
 function localTimeZone(): string | undefined {
@@ -410,6 +431,8 @@ function applyImpl(ctx: Context): void {
     log,
   })
   const extensions = new RemoteBridgeRegistry()
+  // 离线认领的窗口归桥所有，宿主从不认识它（§32.2）：常量是默认值，部署可用环境变量覆盖。
+  const offlineClaimTtlMs = offlineClaimTtl()
   const hub = new BridgeHub({
     extensions,
     gateway: ctx.typertGateway,
@@ -425,6 +448,7 @@ function applyImpl(ctx: Context): void {
     squads,
     push,
     liveActivity,
+    offlineClaimTtlMs,
     onPushRegistered: () => { watchers.sync() },
     now: () => Date.now(),
     clientTimeZone: localTimeZone,

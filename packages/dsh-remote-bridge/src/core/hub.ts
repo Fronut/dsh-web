@@ -2,11 +2,19 @@
  * The bridge's process-wide connection registry and its claims on
  * `approval/request` and `user-questions/request`.
  *
- * The hub is what makes "phone not answering equals refusal" true: a question
- * is claimed only while at least one paired device is connected, the publish
- * has to actually reach someone, and every other path (timeout, agent
- * cancellation, the last phone leaving) delegates to the next answerer, which
- * the Host normalizes to `'unavailable'`.
+ * The hub is what makes "phone not answering equals refusal" true: an approval
+ * is claimed only while at least one paired device is connected, the publish has
+ * to actually reach someone, and every other path (timeout, agent cancellation,
+ * the last phone leaving) delegates to the next answerer, which the Host
+ * normalizes to `'unavailable'`.
+ *
+ * A user question adds the one case where "reach someone" is the notification
+ * rather than the socket: with no paired connection on the wire but a device on
+ * the roster that registered for pushes, the question is claimed for that phone
+ * and the alert is its delivery (§11.3, §32). One predicate decides it — "can a
+ * device that is reachable right now receive a question card" — and it is asked
+ * again every time a connection finishes its hello, because a client that never
+ * declares `questions.v1` going online turns that answer into no.
  *
  * The claim on `user-questions/request` follows the same rules, with three
  * differences that belong to the host's own semantics: delegating is not a
@@ -24,7 +32,8 @@ import type { BridgeConnectionOptions, BridgeTransport, ConnectionAuth } from '.
 import { BridgeConnection } from './connection.ts'
 import { CAP_APPROVALS, CAP_QUESTIONS, TOPIC_APPROVAL_REQUEST, TOPIC_QUESTION_REQUEST } from './protocol.ts'
 import { questionPayload } from './questions.ts'
-import type { QuestionAnswer, UserQuestionRequestLike } from './questions.ts'
+import type { ClaimedQuestion, QuestionAnswer, UserQuestionRequestLike } from './questions.ts'
+import { isDeadPushToken, type PushDeliveryReport } from './push.ts'
 
 /**
  * The fields of an approval question this bridge reads. Structural on purpose:
@@ -79,9 +88,49 @@ function approvalPayload(prompt: PendingPromptView): ApprovalRequestPayload {
  */
 export const QUESTION_CLAIM_GRACE_MS = 60_000
 
+/**
+ * How long a user question is held for a phone this bridge reached by
+ * notification only, in milliseconds (§32.2).
+ *
+ * Inside this window the question exists only on the phone's side: the alert is
+ * out, no socket has it, and the host's own answerer chain has not been started.
+ * When it runs out the claim is withdrawn and delegated, so the agent behind a
+ * timed ask waits at most this long past its own deadline and the agent behind a
+ * blocking ask (no call id, no deadline) waits at most this long in total — an
+ * accepted cost, because the alternative is a question that vanished while the
+ * phone was asleep. The window is the bridge's own constant and not the host's:
+ * a deployment overrides it, the host never sees it.
+ */
+export const OFFLINE_QUESTION_CLAIM_TTL_MS = 600_000
+
+// Those two windows are different timers and never one. QUESTION_CLAIM_GRACE_MS
+// is a grace on the way OUT: a phone was on the wire, it left, and the window is
+// that phone's reconnect budget before the held claim is delegated.
+// OFFLINE_QUESTION_CLAIM_TTL_MS is the whole lifetime of a claim that never had a
+// phone on the wire at all. One claim can be covered by both in turn — claimed for
+// the absent phone, handed to the phone that then declared the channel, left by
+// that phone again — and whichever is due first releases it. The release is
+// idempotent (the claim is deleted before it is delegated and the chain it starts
+// is memoized), so the later timer finds no claim and the host's own answerer is
+// started at most once.
+
+/** Which path a user question takes right now (§11.3). */
+type QuestionMode = 'online' | 'offline' | 'nobody'
+
+/** What the hub is built with: the bridge's shared options plus the windows it owns. */
+export interface BridgeHubOptions extends BridgeConnectionOptions {
+  /**
+   * The offline claim window, in milliseconds.
+   *
+   * Defaults to {@link OFFLINE_QUESTION_CLAIM_TTL_MS}; a deployment knob, and the
+   * seam a suite uses to move the window instead of waiting it out.
+   */
+  readonly offlineClaimTtlMs?: number
+}
+
 /** The bridge's live connections plus the answerer it composes onto the approval chain. */
 export class BridgeHub {
-  readonly #options: BridgeConnectionOptions
+  readonly #options: BridgeHubOptions
   readonly #connections = new Set<BridgeConnection>()
   /**
    * The release this hub has scheduled for the user questions no paired device
@@ -89,8 +138,18 @@ export class BridgeHub {
    * claim and there is never more than one of them.
    */
   #questionReleaseTimer: NodeJS.Timeout | undefined
+  /**
+   * The offline claims still waiting on a phone, by wire call id, each with the
+   * timer that holds it for its window.
+   *
+   * A question leaves this table the moment the phone takes it over, answers it,
+   * or the window releases it, so a call id in here is a question no reachable
+   * device has been shown — which is exactly what {@link #reviewOfflineClaims}
+   * withdraws when a hello makes that permanent.
+   */
+  readonly #offlineClaims = new Map<string, NodeJS.Timeout>()
 
-  constructor(options: BridgeConnectionOptions) {
+  constructor(options: BridgeHubOptions) {
     this.#options = options
   }
 
@@ -117,6 +176,7 @@ export class BridgeHub {
         onDeclare: (fresh) => {
           this.replayQuestions(fresh)
           this.replayApprovals(fresh)
+          this.#reviewOfflineClaims()
         },
       },
       transport,
@@ -172,6 +232,10 @@ export class BridgeHub {
    */
   replayQuestions(connection: BridgeConnection): void {
     if (!connection.paired || !connection.declares(CAP_QUESTIONS)) return
+    // A phone that can take a card is on the wire: the windows that held these
+    // claims for nobody are over. The claims themselves are handed over below
+    // rather than released — they are this phone's to answer now.
+    this.#cancelOfflineClaims()
     // The claim's own state, not `open` for every claim: a question whose
     // foreground wait the host already ended is `continued`, and replaying it as
     // open tells the phone to wait on an agent that has already moved on. The
@@ -253,11 +317,13 @@ export class BridgeHub {
   /**
    * The body of this plugin's `user-questions/request` listener.
    *
-   * Claimed only while a paired device is connected and the ask names an agent:
-   * the payload has no session field of its own, and a question nobody can be
-   * told about is not one this bridge may hold. The wire id is the host's own
-   * when the ask is timed, and minted here when it is blocking and the host
-   * assigned none — either way the phone answers the id it was shown. A claim
+   * Claimed only while a device that is reachable right now can be shown the
+   * card: a paired connection that declared `questions.v1`, or — with no phone on
+   * the wire — a roster device that registered for notifications, which the alert
+   * reaches instead of a frame (§11.3, §32). The payload has no session field of
+   * its own, so an ask that names no agent is delegated either. The wire id is the
+   * host's own when the ask is timed, and minted here when it is blocking and the
+   * host assigned none — either way the phone answers the id it was shown. A claim
    * nobody received is withdrawn at once instead of holding the agent until the
    * host's deadline. For a timed ask the host's own remaining wait travels with
    * the first frame as `expiresAt`, and every later move of that deadline is
@@ -269,7 +335,14 @@ export class BridgeHub {
   async question(request: UserQuestionRequestLike, next: () => Promise<QuestionAnswer>): Promise<QuestionAnswer> {
     const sessionId = request.agent?.id
     if (sessionId === undefined) return await next()
-    if (this.pairedClients === 0) return await next()
+    // With no phone on the wire the roster decides, and reading it is the file the
+    // mount already loaded: awaiting the memoized load keeps the first question of
+    // a process from being delegated only because that read had not finished.
+    if (this.pairedClients === 0) await this.#options.roster.load()
+    const mode = this.#questionMode()
+    // Nobody reachable can be shown this question: it belongs to the next answerer,
+    // exactly as it did before the offline window existed.
+    if (mode === 'nobody') return await next()
     // A blocking ask carries no `wait`: the host has no call id for it, but the
     // phone needs a handle to answer with, so one is minted in this bridge's own
     // namespace. Resolving the promise held here needs no host identity.
@@ -303,6 +376,7 @@ export class BridgeHub {
       },
     })
     if (claim === undefined) return await next()
+    if (mode === 'offline') return await this.#holdOfflineClaim(sessionId, callId, claim)
     // The host's own first wait frame is folded into this same frame: a phone is
     // handed the question and how long it has together, rather than a card that a
     // second update then races. A claim with no frame publishes no deadline,
@@ -340,7 +414,10 @@ export class BridgeHub {
   /** Close every connection and withdraw every question. Idempotent. */
   dispose(): void {
     // Unloading is not a phone going away: nothing can come back for these
-    // claims, so the window is dropped and the release happens right here.
+    // claims, so every window is dropped and the release happens right here — the
+    // offline ones through their own entry, so this route also starts the host's
+    // chain at most once.
+    this.#releaseOfflineClaims('the bridge unloaded')
     this.#cancelQuestionRelease()
     for (const connection of [...this.#connections]) {
       this.#connections.delete(connection)
@@ -377,6 +454,166 @@ export class BridgeHub {
     if (this.#questionReleaseTimer === undefined) return
     clearTimeout(this.#questionReleaseTimer)
     this.#questionReleaseTimer = undefined
+  }
+
+  /**
+   * Which path a user question takes right now (§11.3).
+   *
+   * The one entry, read twice: when a question arrives, and again when a paired
+   * connection finishes its hello while an offline claim is still held. Both
+   * moments ask the same thing — can a device that is reachable right now receive
+   * a question card — and answering it in two places is how two answers drift
+   * apart.
+   * @returns `online` for the ordinary claim-and-broadcast path, `offline` for a
+   * claim held for a phone reached by notification, and `nobody` when the question
+   * has to go straight to the next answerer.
+   */
+  #questionMode(): QuestionMode {
+    for (const connection of this.#connections) {
+      if (connection.paired && connection.declares(CAP_QUESTIONS)) return 'online'
+    }
+    // A paired connection is on the wire and none of them declared the channel: no
+    // one can be shown a card, and a claim held for the phone that was never there
+    // would make the agent wait out a window for a decision nobody can give.
+    if (this.pairedClients > 0) return 'nobody'
+    // No key, no sender: an alert that cannot be sent is not a delivery, so the
+    // question is not claimed for a phone that would never learn it exists.
+    if (this.#options.push?.enabled !== true) return 'nobody'
+    return this.#options.roster.pushTargets().length > 0 ? 'offline' : 'nobody'
+  }
+
+  /**
+   * Hold one question for a phone that is not on the wire (§32).
+   *
+   * No socket is paired, so this claim's own first frame would reach nobody: the
+   * notification IS its delivery, and it is sent whether or not a broadcast would
+   * have landed. Inside the window the question exists only on the phone's side;
+   * the phone that comes back is handed the card by the replay in `onDeclare`,
+   * and the phone that answers settles it through the ordinary path.
+   * @param sessionId - the session that asked.
+   * @param callId - the wire id the phone will answer under.
+   * @param claim - the claim this bridge just opened.
+   * @returns the phone's answer, or whatever the next answerer says.
+   */
+  async #holdOfflineClaim(sessionId: string, callId: string, claim: ClaimedQuestion): Promise<QuestionAnswer> {
+    this.#armOfflineClaim(callId)
+    // The report is the only way this bridge learns that the phone it claimed for
+    // is gone for good: a frame would have carried that fact, an alert does not.
+    this.#options.push?.notify('question', sessionId, (report) => { this.#onQuestionPushed(callId, report) })
+    try {
+      return await claim.answer
+    } finally {
+      // Every path that ends this claim — answered, delegated, expired by the host
+      // — drops its window here, so no timer outlives the question it was armed for.
+      this.#cancelOfflineClaim(callId)
+    }
+  }
+
+  /**
+   * Read one alert's delivery report (§32.5).
+   *
+   * Three APNs answers are final about a registration: 410 with `Unregistered`, or
+   * `Unregistered`/`BadDeviceToken` on any status. The device is cleaned off the
+   * roster, and the claim is kept only while some other registered device is still
+   * there to be told; when the last one is gone the question cannot reach a phone
+   * at all, so it goes back to the host's chain now instead of at the end of a
+   * window nobody is left to use.
+   * @param callId - the offline claim this notification was about.
+   * @param report - how the announcement ended.
+   */
+  #onQuestionPushed(callId: string, report: PushDeliveryReport): void {
+    const dead = report.failures.filter(failure => isDeadPushToken(failure)).map(failure => failure.deviceToken)
+    if (dead.length === 0) return
+    // The roster still lists these rows — the cleanup is a file write — so they are
+    // subtracted here rather than waited out: a claim decision may not block on a disk.
+    const survivors = this.#options.roster.pushTargets().filter(({ push }) => !dead.includes(push.deviceToken))
+    void this.#forgetDeadTokens(dead)
+    if (survivors.length > 0) return
+    this.#releaseOfflineClaim(callId, 'APNs refused every device token on the roster')
+  }
+
+  /** Drop each dead registration from the roster, then let the watchers settle. */
+  async #forgetDeadTokens(tokens: readonly string[]): Promise<void> {
+    try {
+      let dropped = false
+      for (const token of tokens) dropped = (await this.#options.roster.removePush(token)) || dropped
+      // A row that lost the card tokens of its install may have lost its last
+      // watcher with them, and a watcher is a follow stream this bridge keeps open.
+      if (dropped) this.#options.onPushRegistered?.()
+    } catch (error) {
+      this.#options.log(`a dead push registration could not be cleaned up: ${String(error)}`)
+    }
+  }
+
+  /**
+   * End every offline claim the wire has just made unreachable (§11.3).
+   *
+   * A hello that leaves no paired connection able to take a card — the client
+   * written before `questions.v1` going online — is the same fact the claim point
+   * reads, so it releases the claim at once instead of at the end of its window.
+   */
+  #reviewOfflineClaims(): void {
+    if (this.#offlineClaims.size === 0) return
+    if (this.#questionMode() === 'offline') return
+    this.#releaseOfflineClaims('no paired connection on the wire can receive a question')
+  }
+
+  /**
+   * Arm the window that holds one offline claim.
+   *
+   * Deliberately a second timer beside {@link #armQuestionRelease}, never the same
+   * one: that window is the reconnect budget of a phone that just left, this one is
+   * the whole lifetime of a claim no phone ever had, and one claim can be governed
+   * by both in turn. Whichever is due first releases it, and the release is
+   * idempotent, so the later one finds no claim.
+   * @param callId - the claim to hold.
+   */
+  #armOfflineClaim(callId: string): void {
+    if (this.#offlineClaims.has(callId)) return
+    const ttl = this.#options.offlineClaimTtlMs ?? OFFLINE_QUESTION_CLAIM_TTL_MS
+    const timer = setTimeout(() => {
+      this.#releaseOfflineClaim(callId, 'the offline claim window ended')
+    }, Math.max(0, ttl))
+    // A question held for a phone must never keep the host process alive.
+    timer.unref?.()
+    this.#offlineClaims.set(callId, timer)
+  }
+
+  /** Drop one claim's window. The claim itself keeps whatever state it has. */
+  #cancelOfflineClaim(callId: string): void {
+    const timer = this.#offlineClaims.get(callId)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    this.#offlineClaims.delete(callId)
+  }
+
+  /** Drop every offline window: a phone is on the wire for those claims now, or they are about to be released. */
+  #cancelOfflineClaims(): void {
+    for (const timer of this.#offlineClaims.values()) clearTimeout(timer)
+    this.#offlineClaims.clear()
+  }
+
+  /**
+   * Release one offline claim back to the host's own chain.
+   *
+   * The one entry every route uses — the window ending, a roster whose tokens are
+   * all dead, a hello that left nobody able to receive, the bridge unloading — so
+   * "the host's chain is started at most once" is a property of this entry rather
+   * than of its callers: `withdraw` deletes the claim before it delegates, and the
+   * chain a claim starts is memoized, so a second route releases nothing and starts
+   * nothing, and no notification is sent for a question that already left.
+   * @param callId - the claim to release.
+   * @param reason - why, logged once when something really was released.
+   */
+  #releaseOfflineClaim(callId: string, reason: string): void {
+    this.#cancelOfflineClaim(callId)
+    const released = this.#options.questions.withdraw([callId])
+    if (released > 0) this.#options.log(`an offline-claimed user question was released: ${reason}`)
+  }
+
+  /** Release every offline claim through {@link #releaseOfflineClaim}. */
+  #releaseOfflineClaims(reason: string): void {
+    for (const callId of [...this.#offlineClaims.keys()]) this.#releaseOfflineClaim(callId, reason)
   }
 
   /** Abandon every approval: no paired device is left to answer one. */

@@ -286,6 +286,8 @@ export interface HarnessOptions {
   readonly squads?: SquadTransport
   /** The outbound notification path; the default models a bridge with no APNs key. */
   readonly push?: PushNotifier
+  /** The offline claim window; the default is the production one. */
+  readonly offlineClaimTtlMs?: number
   /** The lock-screen card path; the default models a bridge that sends no card. */
   readonly liveActivity?: LiveActivityNotifier
   /** The roster-change hook the standing watchers are armed from. */
@@ -493,6 +495,7 @@ export function makeBareHub(options: HarnessOptions = {}): BareHubHarness {
     ...(options.push === undefined ? {} : { push: options.push }),
     ...(options.liveActivity === undefined ? {} : { liveActivity: options.liveActivity }),
     ...(options.onPushRegistered === undefined ? {} : { onPushRegistered: options.onPushRegistered }),
+    ...(options.offlineClaimTtlMs === undefined ? {} : { offlineClaimTtlMs: options.offlineClaimTtlMs }),
     now: () => Date.now(),
     clientTimeZone: () => undefined,
     log: (message: string) => { logs.push(message) },

@@ -83,6 +83,40 @@ export interface PushSendResult {
   readonly reason?: string
 }
 
+/** One delivery a sender refused, in the words the bridge needs to read it. */
+export interface PushDeliveryFailure {
+  /** The registration APNs refused: the roster row holding it is a device that no longer exists. */
+  readonly deviceToken: string
+  /** The status APNs answered, when it answered at all. */
+  readonly status?: number
+  /** The reason APNs named, or this bridge's own note. */
+  readonly reason?: string
+}
+
+/** What one {@link PushNotifier.notify} ended up doing, once every attempt settled. */
+export interface PushDeliveryReport {
+  /** How many devices took the notification. */
+  readonly delivered: number
+  /** Every attempt that did not land, in target order. */
+  readonly failures: readonly PushDeliveryFailure[]
+}
+
+/**
+ * @param failure - one refused delivery.
+ * @returns whether the registration behind it is dead for good.
+ *
+ * APNs says a token will never work again in three ways: 410 with
+ * `Unregistered`, and 400 with `Unregistered` or `BadDeviceToken`. All three are
+ * final facts about the registration — the app was removed, or this token belongs
+ * to another environment or bundle — so it is cleaned up instead of retried, and
+ * a claim held for it is a claim held for a phone that cannot come back.
+ */
+export function isDeadPushToken(failure: PushDeliveryFailure): boolean {
+  const reason = failure.reason ?? ''
+  if (reason === 'Unregistered' || reason === 'BadDeviceToken') return true
+  return failure.status === 410
+}
+
 /** Whatever actually reaches a device; the APNs client implements this. */
 export interface PushSender {
   send(target: PushAddress, notification: PushNotification): Promise<PushSendResult>
@@ -210,11 +244,16 @@ export class PushNotifier {
    * throws cannot reach it.
    * @param event - what happened.
    * @param sessionId - the session it happened to.
+   * @param onReport - receives how the announcement ended, once every attempt has
+   * settled. A caller that held something for a phone — an offline claim (§32) —
+   * needs to know whether any phone was actually told, and may not block the
+   * caller's own path on an APNs round trip to find out. Not called when nothing
+   * was attempted: no sender, no target, or a rate limit that dropped this event.
    */
-  notify(event: PushEvent, sessionId: string): void {
+  notify(event: PushEvent, sessionId: string, onReport?: (report: PushDeliveryReport) => void): void {
     if (this.#options.sender === undefined) return
     try {
-      this.#announce(event, sessionId)
+      this.#announce(event, sessionId, onReport)
     } catch (error) {
       // The caller is a frame path — a delta broadcast or a claim — and a
       // notification that cannot even be built must not end a follow stream.
@@ -223,7 +262,7 @@ export class PushNotifier {
   }
 
   /** Build and start one event's deliveries. */
-  #announce(event: PushEvent, sessionId: string): void {
+  #announce(event: PushEvent, sessionId: string, onReport?: (report: PushDeliveryReport) => void): void {
     const sender = this.#options.sender
     if (sender === undefined) return
     const targets = this.#options.targets()
@@ -231,16 +270,40 @@ export class PushNotifier {
     const now = this.#now()
     if (!this.#admit(event, sessionId, now)) return
     const notification = buildPushNotification(event, sessionId, this.#labelsOf(sessionId))
+    const failures: PushDeliveryFailure[] = []
+    let delivered = 0
+    let pending = targets.length
+    // One report per announcement, after the last attempt settled: a half-read
+    // count is worse than none, because the caller acts on it.
+    const settleOne = (failure: PushDeliveryFailure | undefined): void => {
+      if (failure === undefined) delivered += 1
+      else failures.push(failure)
+      pending -= 1
+      if (pending > 0 || onReport === undefined) return
+      try {
+        onReport({ delivered, failures })
+      } catch (error) {
+        this.#log(`push ${event} for ${sessionId} could not be reported: ${String(error)}`)
+      }
+    }
     for (const target of targets) {
       void Promise.resolve()
         .then(async () => await sender.send(target, notification))
         .then((result) => {
-          if (!result.ok) {
-            this.#log(`push ${event} for ${sessionId} was not delivered (${result.status ?? '-'} ${result.reason ?? 'no reason'})`)
+          if (result.ok) {
+            settleOne(undefined)
+            return
           }
+          this.#log(`push ${event} for ${sessionId} was not delivered (${result.status ?? '-'} ${result.reason ?? 'no reason'})`)
+          settleOne({
+            deviceToken: target.deviceToken,
+            ...(result.status === undefined ? {} : { status: result.status }),
+            ...(result.reason === undefined ? {} : { reason: result.reason }),
+          })
         })
         .catch((error: unknown) => {
           this.#log(`push ${event} for ${sessionId} failed: ${String(error)}`)
+          settleOne({ deviceToken: target.deviceToken })
         })
     }
   }
