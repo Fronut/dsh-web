@@ -1560,6 +1560,9 @@ importers:
       '@linxin666/dsh-ssh':
         specifier: workspace:*
         version: link:../dsh-ssh
+      '@linxin666/dsh-task-board-remote':
+        specifier: workspace:*
+        version: link:../dsh-task-board-remote
       '@linxin666/dsh-update':
         specifier: workspace:*
         version: link:../dsh-update

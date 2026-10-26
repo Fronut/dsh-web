@@ -191,6 +191,7 @@
     "@linxin666/dsh-remote-web-ui": "workspace:*",
     "@linxin666/dsh-update": "workspace:*",
     "@linxin666/dsh-remote-bridge": "workspace:*",
+    "@linxin666/dsh-task-board-remote": "workspace:*",
     "@linxin666/dsh-ssh": "workspace:*",
     "@linxin666/dsh-liangshen": "workspace:*",
     "@linxin666/dsh-client-ui-skill-explorer": "workspace:*",
