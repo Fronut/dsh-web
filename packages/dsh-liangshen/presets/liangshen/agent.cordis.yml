@@ -187,25 +187,22 @@
 
 # ── the wire ────────────────────────────────────────────────────────────────
 #
-# On the 0.2.x cohort the wire is chosen by WHICH EXECUTOR this composition
-# mounts, not by a runtime call: the host bundle mounts the native executor
-# and leaves the ptc one disabled, and a preset that wants the collapsed wire
-# mounts `@deepseek-ai/dsh-tool-executor-ptc` for its own scope — exactly how
-# the builtin `ptc` preset does it (`web-app/presets/ptc.patch.yml`).
+# `presentation` on the `tool-catalog` row above IS the wire. The plugin
+# declares it on each agent scope through `agent.ctx.tools.presentAs` as soon
+# as the scope exists, then re-assembles so the declaration reaches the
+# request the model actually receives; `native` keeps the assembled roster,
+# `ptc` collapses it to the single `run_code` transport. A deployment with no
+# PTC runtime, a host that declines the declaration, or a wire that offers no
+# schema projection keeps the native surface and warns once.
 #
-# So `presentation` on the `tool-catalog` row above decides whether THIS row
-# is mounted: before declaring, the plugin rewrites its `disabled` from that
-# value (ptc -> false, native -> true), which is what keeps the shipped
-# default and the settings switch agreeing. The row ships enabled because the
-# shipped `presentation` is `ptc`.
+# The composition carries NO executor row. The 0.2.1-rc.3 SDK ships the
+# presentation as a tool property selected through `presentAs`; it publishes no
+# `@deepseek-ai/dsh-tool-executor-ptc`, so a row naming it never starts and the
+# preset's load audit reports it alongside the rows that did mount (2026-10-26).
 #
-# `tool-catalog`'s own `agent.ctx.tools.presentAs` declaration is the
-# pre-0.2.0 path: that method no longer exists in the SDK, so it is a
-# compatibility no-op there, and the catalog warns once if a ptc-configured
-# request turns out to carry no `run_code`.
-- id: tool-executor-ptc
-  name: '@deepseek-ai/dsh-tool-executor-ptc'
-  disabled: false
+# The row ships `presentation: 'ptc'` because that is the shipped default, and
+# the settings overlay rewrites the SAME key, so the settings switch and the
+# composition never disagree.
 
 - id: working-context
   name: ./working-context.mjs

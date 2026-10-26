@@ -22,7 +22,7 @@ preset 在两个平台都挂上游 shell 栈，并用作用域级限制 API 施�
 - 分页只在 `ptc` 下作用于整个可达面。折叠后的 wire 让作用域注册表成为工具唯一可被触达的面，因此限制在那里就是分页本身的含义。`both` 刻意不安装限制：它的 wire 在 `run_code` 之外同时携带完整原生清单，被扣留的命名空间因此只在直调面缺席，程序内仍可触达——这份可达性由 wire 自己携带，因为 wire 持有全部已注册工具，且没有任何东西把被扣留的那些从作用域注册表里移除。`native` 根本不带程序，wire 分区就是那里分页的全部。
 - 目录里的被扣留命名空间摘要逐呈现写明各自的可达性——`ptc` 下程序内同样不可达、`both` 下程序内仍可达、`native` 下不存在程序传输——而不再用同一句话描述两种代码呈现，让读者自己去和后面的程序契约对账。
 - 激活状态依旧从持久会话事件流重建，因此压缩与恢复无需进程内存即可还原同一张激活集合与同一张限制集合。
-- 在 0.2.x cohort 上，wire 本身是在**组合时**选定的（2026-10-18）。`agent.ctx.tools.presentAs` 已不在 SDK 中，因此预设那次声明在该 cohort 上是兼容性空操作，光有 `tool-catalog` 行上的取值什么也改不了：配着 `ptc` 的会话静默跑在 29 个工具的原生面上。现在组合里带一行 `tool-executor-ptc`（与内置 `ptc` 预设挂的是同一行），`applyPresetOverrides` 用同一个设置写它的挂载状态——`ptc` 挂上、`native` 摘掉——于是一个设置仍然决定一条 wire。旧声明调用为较早的 cohort 保留；目录里那条笼统的「没有作用域 tools 视图」告警去掉了（在该 cohort 上 API 缺失并非失败），改为「写着 `ptc` 而请求里没有 `run_code`」时告警一次并点名要挂的那一行。基准变体也移动同一行，因此 `native` 臂重新真的在评估原生 wire，而不是静默重跑 `ptc` 臂。
+- wire 由预设自己按作用域的声明决定（2026-10-26）。`agent.ctx.tools.presentAs(mode)` 就是 0.2.1 的 API——内置预设的 `@deepseek-ai/dsh-agent-tool-presentation` 行调用的正是它，作用于所挂载的 scope——因此 `tool-catalog` 行上的 `presentation` 取值**就是** wire：插件在 agent scope 一出现时就声明它，声明落在组装中途时重新组装一次；部署没挂 PTC runtime、宿主拒绝声明、或读不到任何 schema 投影时退回原生面并告警一次。组合里不再有执行器行：曾有一版挂了 `@deepseek-ai/dsh-tool-executor-ptc`，但 SDK 在 0.2.1-rc.3 并不发布该包（npm 上也从未有过），那一行永远不会启动，预设的激活审计会把它和真正挂上的行并列报出。`applyPresetOverrides` 只写 `tool-catalog` 一个取值，基准变体改写同一行，因此设置开关、出厂组合与两个基准臂仍然只决定一条 wire。
 
 ## Alternatives considered
 

@@ -500,32 +500,22 @@ export interface PresetOverrides {
   dispatcher?: boolean
 }
 
-/**
- * One settings overlay entry: the row it targets, the config keys it writes,
- * and the row-level keys it writes (`disabled`). The two are separate because
- * a row's mount state is not part of its config.
- */
-type OverrideTarget = readonly [
-  string,
-  Readonly<Record<string, unknown>>,
-  Readonly<Record<string, unknown>>?,
-]
+/** One settings overlay entry: the row it targets and the config keys it writes. */
+type OverrideTarget = readonly [string, Readonly<Record<string, unknown>>]
 
 /**
- * The overlay table: settings field to composition row and keys.
+ * The overlay table: settings field to composition row and config key.
  *
- * `presentation` writes two places on the 0.2.x cohort. The `tool-catalog` row
- * keeps the value for the catalog's own description and for the legacy
- * declaration, and `tool-executor-ptc`'s mount state IS the wire: ptc mounts it,
- * native unmounts it, because the SDK moved the choice from a runtime call to
- * the composition of executor plugins.
+ * `presentation` writes the `tool-catalog` row alone, because that row's
+ * declaration IS the wire: the plugin hands the value to
+ * `agent.ctx.tools.presentAs` and re-assembles, so the catalog text and the
+ * declared presentation always travel together. The composition carries no
+ * executor row to mount or unmount.
  */
 function overrideTargets(overrides: PresetOverrides): OverrideTarget[] {
-  const presentation = overrides.presentation
   return [
-    ['tool-catalog', presentation === undefined ? {} : { presentation }],
-    ['minimal-prompt', overrides.dispatcher === undefined ? {} : { dispatcher: overrides.dispatcher }],
-    ['tool-executor-ptc', {}, presentation === undefined ? {} : { disabled: presentation !== 'ptc' }],
+    ['tool-catalog', { ...overrides.presentation === undefined ? {} : { presentation: overrides.presentation } }],
+    ['minimal-prompt', { ...overrides.dispatcher === undefined ? {} : { dispatcher: overrides.dispatcher } }],
   ]
 }
 
@@ -549,13 +539,10 @@ export function applyPresetOverrides(
   return rows.map((row) => {
     const target = table.find(([id]) => id === (row as CompositionRow).id)
     if (target === undefined) return row
-    const patch = target[1]
-    const rowPatch = target[2] ?? {}
-    if (Object.keys(patch).length === 0 && Object.keys(rowPatch).length === 0) return row
-    const withRowPatch = Object.keys(rowPatch).length === 0 ? row : { ...row, ...rowPatch }
-    if (Object.keys(patch).length === 0) return withRowPatch
-    const config = (withRowPatch as CompositionRow).config
-    if (typeof config !== 'object' || config === null || Array.isArray(config)) return withRowPatch
-    return { ...withRowPatch, config: { ...(config as Record<string, unknown>), ...patch } }
+    const [, patch] = target
+    if (Object.keys(patch).length === 0) return row
+    const config = (row as CompositionRow).config
+    if (typeof config !== 'object' || config === null || Array.isArray(config)) return row
+    return { ...row, config: { ...(config as Record<string, unknown>), ...patch } }
   })
 }
