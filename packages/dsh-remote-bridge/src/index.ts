@@ -49,7 +49,9 @@ import { QuestionClaims } from './core/questions.ts'
 import { WS_PATH } from './core/protocol.ts'
 import { SessionMeta, type SessionStoreFace, type SessionTitleFace, type WorkspacesFace } from './core/session-meta.ts'
 import { SessionPermissions, type ApprovalPolicyFace, type PermissionPresetsFace, type SandboxPolicyFace } from './core/session-permissions.ts'
-import { UsageService, type CredentialStoreFace, type SessionRosterFace, type SettingsFace } from './core/usage.ts'
+import { selectionOf, modelSelectionOf } from './core/connection.ts'
+import { UsageService, type CredentialStoreFace, type SessionRosterFace, type SessionRouteFace, type SettingsFace } from './core/usage.ts'
+import { UsageStatsReader } from './core/usage-stats.ts'
 import { wireArgs, type GatewayPeer } from './core/wire.ts'
 import { dshHome } from './host/dsh-home.ts'
 import { ApnsSender, apnsConfigFromEnv } from './host/apns.ts'
@@ -57,6 +59,7 @@ import { StandingWatchers } from './host/watchers.ts'
 import { LoopbackSquads } from './host/squads.ts'
 import { mountOnce } from './mount-once.ts'
 import { makePairTokenRoute } from './host/routes.ts'
+import { hostWebOrigin, LoopbackUsage } from './host/usage-stats.ts'
 import { isWebSocketUpgrade, presentedTokenOf, readSecWebSocketKey, refuseUpgrade, serveUpgrade } from './host/websocket.ts'
 
 /** Loader row identity of this plugin. */
@@ -185,6 +188,48 @@ function sessionRoster(ctx: Context, peer: GatewayPeer, log: (message: string) =
 }
 
 /**
+ * 一条会话此刻的路由，按 `usage.session` 的模型窗口那一档读出来。
+ *
+ * 折叠与 `session.models` 的 `current` 逐字一致：下一步的选择、其次是用过的那个、
+ * 最后才是目录默认。两个方法读同一个折叠，就不可能出现「模型选择器说 A、模型窗口
+ * 按 B 算」这种事。每次读都走本桥自己的 owner peer；读不到任何一档就回 undefined，
+ * 那一档读数（`modelContextWindow`）因此根本不出现，而不是补一个默认值。
+ * @param ctx - 插件的上下文，携带网关。
+ * @param peer - 本桥自己的 owner peer，每次调用都以它发声。
+ * @param log - 读不到时记一行日志。
+ * @returns 路由 face。
+ */
+function sessionRoute(ctx: Context, peer: GatewayPeer, log: (message: string) => void): SessionRouteFace {
+  const invoke = async (method: string, args: Readonly<Record<string, unknown>>): Promise<unknown> => await ctx.typertGateway.invoke({
+    namespace: 'session',
+    method,
+    args: wireArgs('session', method, args),
+    peer,
+  })
+  return {
+    current: async (sessionId: string) => {
+      try {
+        const folded = modelSelectionOf(await invoke('projections', { sessionId }))
+        const selected = folded.next ?? folded.lastUsed
+        // 还没选过模型的会话在目录默认上——它下一步就会用那个，也正是
+        // `session.models` 对同一条会话给出的答案。
+        const fallback = selected === undefined ? selectionOf(catalogDefaultOf(await invoke('modelCatalog', {}))) : undefined
+        const answer = selected ?? fallback
+        return answer === undefined ? undefined : { provider: answer.provider, model: answer.model }
+      } catch (error) {
+        log(`the route of session ${sessionId} could not be read: ${String(error)}`)
+        return undefined
+      }
+    },
+  }
+}
+
+/** `session/modelCatalog` 里的 `default` 一格。 */
+function catalogDefaultOf(value: unknown): unknown {
+  return typeof value === 'object' && value !== null ? (value as { default?: unknown }).default : undefined
+}
+
+/**
  * 解析 `usage.v1` 要读的宿主服务，现在就解析一次。
  *
  * 与元数据的三个 face 同一条理由：四者都不在本插件的 `inject` 里，缺一个不该
@@ -203,6 +248,7 @@ function usageFaces(ctx: Context, peer: GatewayPeer, log: (message: string) => v
     roster: sessionRoster(ctx, peer, log),
     credentials: ctx.get('credentials') as CredentialStoreFace | undefined,
     settings: ctx.get('settings') as SettingsFace | undefined,
+    route: sessionRoute(ctx, peer, log),
   }
 }
 
@@ -272,7 +318,12 @@ function applyImpl(ctx: Context): void {
   // 用量读数：一条会话的窗口与组成靠宿主广播的事件折出来，余额靠宿主自己的
   // 凭据与设置查出来。一个宿主一份、所有连接共享——两台手机重复问，上游也只
   // 该收到一次请求（core/usage.ts）。
-  const usage = new UsageService({ faces: () => usageFaces(ctx, ownerPeer, log), now: () => Date.now(), log })
+  // 台账聚合读的是宿主上 dsh-usage 插件的两条 HTTP 路由，走本机回环 origin：那个
+  // 插件不发布任何 cordis 服务，端口从 `webServer` 来（先 getOrigin()，拿不到再退回
+  // 监听端口）。没有它时 `usage.stats` 答 no-usage-plugin，其余读数一概不变。
+  const usageRoutes = new LoopbackUsage({ origin: () => hostWebOrigin(ctx.webServer), log })
+  const usageStats = new UsageStatsReader({ transport: () => usageRoutes, now: () => Date.now(), log })
+  const usage = new UsageService({ faces: () => usageFaces(ctx, ownerPeer, log), now: () => Date.now(), stats: usageStats, log })
   // The push channel is OFF unless this machine holds an Apple signing key: no
   // key, no sender, and every notification path is a no-op — which is what keeps
   // the protocol byte-identical for every deployment that has none (§28).

@@ -48,6 +48,7 @@ import {
   CAP_SQUADS,
   CAP_SUBAGENT_THREAD,
   CAP_USAGE,
+  CAP_USAGE_STATS,
   CAP_WORKSPACE,
   CODE_APPROVAL_UNKNOWN,
   CODE_COMMANDS_UNAVAILABLE,
@@ -103,6 +104,7 @@ import {
   METHOD_SQUADS_STATE,
   METHOD_USAGE_BALANCE,
   METHOD_USAGE_SESSION,
+  METHOD_USAGE_STATS,
   METHOD_WORKSPACE_LIST,
   MINOR,
   PROTO,
@@ -502,15 +504,23 @@ function answersOf(value: unknown): readonly QuestionAnswerItem[] | undefined {
   return answers
 }
 
-/** One model selection, in the field names the protocol publishes. */
-type ModelSelection = {
+/**
+ * One model selection, in the field names the protocol publishes.
+ *
+ * Exported beside {@link selectionOf} and {@link modelSelectionOf} because the
+ * host half resolves a session's current route for `usage.stats`'s neighbour
+ * key `usage.session`/`modelContextWindow` with exactly this fold: two readings
+ * of "which model is this session on" would let the two methods name different
+ * routes for the same session.
+ */
+export type ModelSelection = {
   readonly provider: string
   readonly model: string
   readonly reasoningEffort?: string
 }
 
 /** @returns the selection this value describes, or undefined when it describes none. */
-function selectionOf(value: unknown): ModelSelection | undefined {
+export function selectionOf(value: unknown): ModelSelection | undefined {
   if (!isRecord(value)) return undefined
   const provider = optionalText(value.provider)
   const model = optionalText(value.model)
@@ -525,7 +535,7 @@ function selectionOf(value: unknown): ModelSelection | undefined {
  * Both halves stay optional: a session that never ran has neither, and the
  * catalog default is then the only truthful current value.
  */
-function modelSelectionOf(value: unknown): { readonly next?: ModelSelection; readonly lastUsed?: ModelSelection } {
+export function modelSelectionOf(value: unknown): { readonly next?: ModelSelection; readonly lastUsed?: ModelSelection } {
   if (!isRecord(value) || !isRecord(value.values)) return {}
   const selection = value.values.modelSelection
   if (!isRecord(selection)) return {}
@@ -869,6 +879,11 @@ export class BridgeConnection {
     if (USAGE_METHODS.has(frame.m) && !this.declares(CAP_USAGE)) {
       return refusal(CODE_UNKNOWN_METHOD, `unknown method ${frame.m}`)
     }
+    // 台账聚合是另一个能力，因为它读的是另一个插件挂在这个宿主上的路由：不宣告
+    // `usage.stats.v1` 的客户端看不到这个方法，本桥也不会替它去读那两条路由。
+    if (frame.m === METHOD_USAGE_STATS && !this.declares(CAP_USAGE_STATS)) {
+      return refusal(CODE_UNKNOWN_METHOD, `unknown method ${frame.m}`)
+    }
     // Unconditional: a loopback Host buys nothing here. Without a device token
     // only the handshake and the two pairing steps run.
     if (!this.paired && !UNPAIRED_METHODS.has(frame.m)) return refusal(CODE_UNPAIRED, 'this connection is not paired')
@@ -899,6 +914,7 @@ export class BridgeConnection {
       case METHOD_PUSH_REGISTER: return await this.#pushRegister(frame.p)
       case METHOD_USAGE_SESSION: return await this.#usageSession(frame.p)
       case METHOD_USAGE_BALANCE: return await this.#usageBalance(frame.p)
+      case METHOD_USAGE_STATS: return await this.#usageStats(frame.p)
       case METHOD_JOBS_LIST: return await this.#jobsList(frame.p)
       case METHOD_PRESETS_LIST: return await this.#presetsList()
       case METHOD_SESSION_CREATE: return await this.#sessionCreate(frame.p)
@@ -2168,6 +2184,23 @@ export class BridgeConnection {
     const provider = stringArg(payload, 'provider')
     if (provider === undefined) return refusal(CODE_INVALID_ARGS, 'usage.balance requires provider')
     return { ok: true, r: await this.#options.usage.balance(provider) }
+  }
+
+  /**
+   * 答一次 `usage.stats`：宿主自己那份按天记的 token 台账的聚合。
+   *
+   * `days` 省略按 14，超出 60 按 60 收——收窗口的是 `core/usage-stats.ts`，不是
+   * 协议：客户端给的天数只是「想看多深」，不该被当成一次分配。这里只拒绝根本
+   * 不是数字的那种值，其余一律转发，包括读不到时那份 `unsupported`，
+   * 因为「这台 Mac 没挂那个插件」不是一次失败。
+   * @param payload - `{days?}`。
+   */
+  async #usageStats(payload: Readonly<Record<string, unknown>>): Promise<DispatchOutcome> {
+    const days = payload.days
+    if (days !== undefined && (typeof days !== 'number' || !Number.isFinite(days))) {
+      return refusal(CODE_INVALID_ARGS, 'usage.stats requires days to be a number')
+    }
+    return { ok: true, r: await this.#options.usage.stats(days) }
   }
 
   /**

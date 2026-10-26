@@ -43,6 +43,7 @@ export const METHOD_SQUADS_RUN_SQUAD = 'squads.runSquad'
 export const METHOD_PUSH_REGISTER = 'push.register'
 export const METHOD_USAGE_SESSION = 'usage.session'
 export const METHOD_USAGE_BALANCE = 'usage.balance'
+export const METHOD_USAGE_STATS = 'usage.stats'
 
 /** Server-pushed topics of protocol v1. */
 export const TOPIC_SESSION_DELTA = 'session.delta'
@@ -232,6 +233,21 @@ export const CAP_PUSH = 'push.v1'
  * 侧同一 provider + 凭据 60 秒最多一次上游请求）。
  */
 export const CAP_USAGE = 'usage.v1'
+
+/**
+ * 客户端在 `hello` 的 `cap` 数组里宣告它要读宿主自己的用量台账聚合。
+ *
+ * 与 {@link CAP_USAGE} 平级、独立声明：宣告它是 `usage.stats` 进入这个客户端
+ * 协议的唯一前提，不宣告的客户端——包括 `usage.v1` 出现之后、这个能力出现之前
+ * 写下的每一个客户端——收到的仍是 `unknown-method`，本桥也不会替它去读宿主
+ * 上 `dsh-usage` 插件的任何一条路由。
+ *
+ * 拆成独立能力而不是塞进 `usage.v1`，是因为它读的是另一件事：那两半读的是本
+ * 进程自己的事实（一个会话、一条路由的账户），这一半读的是另一个插件挂在这个
+ * 宿主上的 HTTP 路由，而那个插件可能根本没装。老客户端忽略这个未知名字即可，
+ * 它看到的能力表里多一项、别的什么都没有变。
+ */
+export const CAP_USAGE_STATS = 'usage.stats.v1'
 
 /**
  * Capability a client declares in `hello`'s `cap` array to be answered with
@@ -433,6 +449,7 @@ export const KNOWN_METHODS: ReadonlySet<string> = new Set([
   METHOD_PUSH_REGISTER,
   METHOD_USAGE_SESSION,
   METHOD_USAGE_BALANCE,
+  METHOD_USAGE_STATS,
 ])
 
 /** Refusal codes the bridge itself raises (DSH failures cross as their own code). */
@@ -512,6 +529,17 @@ export const PROTO = 1
 /**
  * Minor version this package speaks.
  *
+ * 20 when the usage stats channel shipped: behind {@link CAP_USAGE_STATS} a
+ * client may call {@link METHOD_USAGE_STATS} and read the host's own usage
+ * ledger — today, this month and one row per local day — and behind the same
+ * {@link CAP_USAGE} this bridge now also answers `usage.session` with a
+ * `modelContextWindow` when the model catalog of the session's route declares
+ * one, so a client reads one new reply body and one new optional key off the
+ * wire and has to read the name before it asks. The stats half is independent
+ * of {@link CAP_USAGE} on purpose: it reads another plugin's HTTP routes, which
+ * a host may not mount at all, so a client written before this name existed
+ * keeps the two readings it had and the bridge reads no route on its behalf.
+ * No frame, no topic, no existing method and no existing key changes shape.
  * 19 when the usage channel shipped: behind {@link CAP_USAGE} a client may call
  * {@link METHOD_USAGE_SESSION} and read one session's context window and its
  * request's estimated composition, and {@link METHOD_USAGE_BALANCE} and read the
@@ -605,7 +633,7 @@ export const PROTO = 1
  * declares the capability that plugin requires. No addition changed the major
  * version, a frozen field, or an existing method or topic name.
  */
-export const MINOR = 19
+export const MINOR = 20
 
 /**
  * The capabilities this bridge itself serves, as `hello` advertises them.
@@ -635,6 +663,7 @@ export const SERVED_CAPABILITIES: readonly string[] = [
   CAP_SQUADS,
   CAP_PUSH,
   CAP_USAGE,
+  CAP_USAGE_STATS,
 ]
 /** `server` field of the hello response. */
 export const SERVER_ID = 'dsh-remote-bridge'
