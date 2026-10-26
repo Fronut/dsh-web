@@ -36,7 +36,8 @@ The host half starts Chrome lazily on the first tool call or the first tab mount
 | --- | --- | --- |
 | `sidebar.right.pane.tab` | keyed, session | the tab body |
 | `sidebar.right.pane.tab.title` | keyed, session | the chip text and glyph |
-| `conversation.session.header.actions` | list, session | the shortcut that opens or focuses the tab |
+
+The conversation header carries no entry for this tab: the column's own tab strip and the guide capsule already open it, and a third place to click was only crowding that row.
 
 The tab type is registered with `ctx.sidebarRightTabs.register` and opened with `ctx.sidebarRight.openTabIn`. Its kind is `browser-view`, deliberately **not** `browser`: the shipped `@deepseek-ai/dsh-client-ui-sidebar-browser` owns that kind, and a second registration in the extension band takes a kind over, which would shadow the shipped tab out of existence.
 

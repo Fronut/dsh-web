@@ -36,7 +36,8 @@ agent 工具调用 ──► 宿主半区 ──► CDP ──► 专用 Chromiu
 | --- | --- | --- |
 | `sidebar.right.pane.tab` | keyed，session | 标签页内容 |
 | `sidebar.right.pane.tab.title` | keyed，session | chip 的文字与图标 |
-| `conversation.session.header.actions` | list，session | 打开/聚焦该标签页的快捷按钮 |
+
+会话头部不再为该标签页提供入口：右栏自己的 tab strip 与 guide 胶囊已经能打开它，再加第三个入口只是挤占那一行。
 
 标签页类型经 `ctx.sidebarRightTabs.register` 注册，用 `ctx.sidebarRight.openTabIn` 打开。它的 kind 是 `browser-view`，**刻意不是** `browser`：官方 `@deepseek-ai/dsh-client-ui-sidebar-browser` 占用了那个 kind，而 extension 档位会接管同名 kind，复用等于把官方那个标签页顶掉。
 
