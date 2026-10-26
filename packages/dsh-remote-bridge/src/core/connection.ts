@@ -966,7 +966,29 @@ export class BridgeConnection {
     }
   }
 
-  #hello(payload: Readonly<Record<string, unknown>>): DispatchOutcome {    const proto = payload.proto
+  /**
+   * The capabilities this greeting advertises: the protocol's own, and every
+   * capability a mounted extension currently requires a client to declare.
+   *
+   * Computed per greeting rather than held once, because a plugin may register
+   * its table after this bridge was built — a name frozen at build time would
+   * leave that surface invisible to every phone that ever connects. The
+   * protocol's own names come first and keep their order, so a bridge with no
+   * extension mounted advertises exactly the list it always did; extension
+   * names follow in their registry's order. A name both halves know is listed
+   * once.
+   * @returns the served capabilities, one name each.
+   */
+  #servedCapabilities(): string[] {
+    const capabilities = [...SERVED_CAPABILITIES]
+    for (const capability of this.#options.extensions?.capabilities() ?? []) {
+      if (!capabilities.includes(capability)) capabilities.push(capability)
+    }
+    return capabilities
+  }
+
+  #hello(payload: Readonly<Record<string, unknown>>): DispatchOutcome {
+    const proto = payload.proto
     if (proto !== PROTO) return refusal(CODE_PROTO_UNSUPPORTED, `this bridge speaks protocol ${PROTO}`)
     this.#capabilities = capabilitiesOf(payload.cap)
     // The frame form is decided where the frame is written, so the carrier is
@@ -981,7 +1003,7 @@ export class BridgeConnection {
         proto: PROTO,
         minor: MINOR,
         server: SERVER_ID,
-        capabilities: [...SERVED_CAPABILITIES],
+        capabilities: this.#servedCapabilities(),
         resume: 'snapshot',
         auth: this.paired ? 'paired' : 'unpaired',
       },

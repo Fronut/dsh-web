@@ -636,11 +636,24 @@ export const PROTO = 1
 export const MINOR = 20
 
 /**
- * The capabilities this bridge itself serves, as `hello` advertises them.
+ * The capabilities this bridge itself serves, and the opening half of what
+ * `hello` advertises.
  *
- * A capability a mounted plugin adds is not listed here: the bridge cannot know
- * what it is not the author of. A client learns such a capability from the
- * plugin's own documentation, exactly as it did before this list existed.
+ * A capability a mounted plugin adds is not listed here — the bridge is not its
+ * author and names none of them — but `hello` advertises it all the same: the
+ * answer is this list plus every capability the extension registry currently
+ * requires a client to declare (`RemoteBridgeRegistry.capabilities`), computed
+ * on each greeting so a plugin mounted after this bridge was built is visible
+ * to the next phone. A name both halves carry is listed once, and this list
+ * keeps its order at the front, so a bridge with no extension mounted answers
+ * byte for byte the list it always did. Extension names never move
+ * {@link MINOR}: that number describes this protocol, and a plugin's own names
+ * are the plugin's.
+ *
+ * A capability whose whole switch is a declaration — no method, no answer, no
+ * field behind it, such as {@link CAP_APPROVALS} — stays out of this list for
+ * the reason it always did: advertising it would claim a handshake change
+ * without one.
  */
 export const SERVED_CAPABILITIES: readonly string[] = [
   CAP_SESSION_SNAPSHOT_TRIM,
