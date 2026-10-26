@@ -30,6 +30,7 @@ import type { PairingService } from './pairing.ts'
 import type { PushNotifier } from './push.ts'
 import { pushEventOfTurnEnd } from './push.ts'
 import type { ListedQuestion, QuestionAnswerItem, QuestionClaims, QuestionListPayload } from './questions.ts'
+import type { TurnEndQuietGate } from './turn-end-quiet.ts'
 import {
   CAP_AGENTS,
   CAP_COMMANDS,
@@ -241,6 +242,15 @@ export interface BridgeConnectionOptions {
    */
   readonly liveActivity?: LiveActivityNotifier
   /**
+   * The gate a finished turn is announced through (§28, §29).
+   *
+   * Absent is a bridge assembled without one — a suite, or an embedder — and then
+   * both channels report at the frame, exactly as they did before the gate
+   * existed. The mount always hands one, because it is the only assembly that can
+   * read the host's own answer.
+   */
+  readonly turnEndQuiet?: TurnEndQuietGate
+  /**
    * Called after a registration changed the device table.
    *
    * A session's first live-activity token is what asks this bridge to keep a
@@ -255,6 +265,39 @@ export interface BridgeConnectionOptions {
 /** A device the connection proved itself to be, resolved from the upgrade request. */
 export interface ConnectionAuth {
   readonly deviceId: string
+}
+
+/**
+ * Whether one follow increment proves its session is working again.
+ *
+ * Deliberately narrow, and never "anything that is not a turn end": a parent's
+ * stream also carries a settled child's message (`source.kind` `subagent-settled`
+ * or `agent-message`, which the frames read as an agent actor), the usage count the
+ * host publishes as an assistant message finishes, and the catalog changes of the
+ * threads that session spawned. Reading any of those as a new turn would drop the
+ * turn end a waiting phone has not been told about yet — the one whose session is
+ * still busy with a running child, which is the case §28's gate exists for.
+ *
+ * One shared rule on purpose: this connection's own drain and the standing watchers
+ * both read it, so the two paths cannot disagree about what a new turn looks like.
+ * @param delta - one increment of a follow stream.
+ * @returns whether assistant work is streaming, or this session's own user wrote.
+ */
+export function isTurnStartDelta(delta: { readonly kind: string; readonly actor?: { readonly kind?: string } }): boolean {
+  switch (delta.kind) {
+    case 'text':
+    case 'reasoning':
+    case 'tool-call':
+    case 'tool-result':
+      return true
+    case 'user-message':
+      // A message with no actor is not evidence: a durable log written before
+      // sources existed carries none, and guessing "human" there would drop a real
+      // announcement.
+      return delta.actor?.kind === 'human'
+    default:
+      return false
+  }
 }
 
 /** The answer of a subscription's opening frame: a baseline, or why there is none. */
@@ -2463,10 +2506,11 @@ export class BridgeConnection {
         // know. The call returns before anything is sent and swallows its own
         // failures: the frame above is already gone, and a notification is not
         // worth a delayed or aborted stream (protocol §28.5).
-        if (delta.kind === 'turn-end') {
-          this.#options.push?.notify(pushEventOfTurnEnd(delta.reason), subscription.sessionId)
-          this.#options.liveActivity?.noteTurnEnd(subscription.sessionId, delta.reason)
-        }
+        if (delta.kind === 'turn-end') this.#announceTurnEnd(subscription.sessionId, delta.reason)
+        // Only an increment that proves this session's own work proves a new turn; a
+        // settled child, a usage count and a catalog change all arrive here without
+        // meaning the user prompted again.
+        else if (isTurnStartDelta(delta)) this.#options.turnEndQuiet?.noteTurnStarted(subscription.sessionId)
       }
     } catch (error) {
       if (!subscription.controller.signal.aborted) {
@@ -2475,6 +2519,24 @@ export class BridgeConnection {
     } finally {
       this.#forget(subscription)
     }
+  }
+
+  /**
+   * Hand one finished turn to the channel that announces it.
+   *
+   * The gate holds it until the session is quiet (§28, §29); a connection built
+   * without one has no host answer to wait for and reports at the frame.
+   * @param sessionId - the session the turn belonged to.
+   * @param reason - the host's own reason for ending it.
+   */
+  #announceTurnEnd(sessionId: string, reason: string): void {
+    const gate = this.#options.turnEndQuiet
+    if (gate !== undefined) {
+      gate.noteTurnEnd(sessionId, reason)
+      return
+    }
+    this.#options.push?.notify(pushEventOfTurnEnd(reason), sessionId)
+    this.#options.liveActivity?.noteTurnEnd(sessionId, reason)
   }
 
   /** Await a subscription's opening frame under a bounded wait. */
