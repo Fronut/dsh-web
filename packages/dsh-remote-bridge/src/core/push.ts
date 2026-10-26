@@ -16,7 +16,9 @@
  *   screen, which is the last place session content should be;
  * - the same `(sessionId, event)` inside {@link PUSH_DEDUPE_MS} is one
  *   notification, because two phones following one session both see the same
- *   turn end and the user has one lock screen;
+ *   turn end and the user has one lock screen, and one APNs token is one
+ *   delivery, because a token belongs to the app install rather than to one
+ *   pairing, so the rows that share it are still that one phone;
  * - a failed delivery is logged and dropped. Nothing here is awaited by the
  *   delta path, so a broken APNs connection cannot delay, reorder or suppress a
  *   frame that a connected phone is waiting for.
@@ -129,7 +131,13 @@ export interface PushLabels {
 }
 
 export interface PushNotifierOptions {
-  /** The devices that asked to be notified, read per event. */
+  /**
+   * The devices that asked to be notified, read per event.
+   *
+   * The list may carry several rows holding the same `deviceToken`: a phone that
+   * pairs again owns more than one roster row, and a token outlives any one
+   * pairing. Converging them is this module's job, not the caller's.
+   */
   readonly targets: () => readonly PushAddress[]
   /** The sender; absent is a bridge with no signing key, and then nothing happens. */
   readonly sender?: PushSender
@@ -175,6 +183,26 @@ export function buildPushNotification(event: PushEvent, sessionId: string, label
  */
 export function pushEventOfTurnEnd(reason: string): PushEvent {
   return reason === 'completed' ? 'turn-end' : 'turn-error'
+}
+
+/**
+ * One address per APNs token, the first row winning.
+ *
+ * A token is minted by the app install rather than by a pairing, so every row
+ * holding the same token is the same phone: two rows are one lock screen, and
+ * sending to both shows one event twice.
+ * @param targets - every row the roster reported as a notification target.
+ * @returns one address per token, in roster order.
+ */
+function perToken(targets: readonly PushAddress[]): PushAddress[] {
+  const seen = new Set<string>()
+  const kept: PushAddress[] = []
+  for (const target of targets) {
+    if (seen.has(target.deviceToken)) continue
+    seen.add(target.deviceToken)
+    kept.push(target)
+  }
+  return kept
 }
 
 /**
@@ -265,7 +293,10 @@ export class PushNotifier {
   #announce(event: PushEvent, sessionId: string, onReport?: (report: PushDeliveryReport) => void): void {
     const sender = this.#options.sender
     if (sender === undefined) return
-    const targets = this.#options.targets()
+    // One token is one app install is one lock screen, so the rows converge before
+    // anything is sent: the roster may hold the same phone twice without the
+    // phone being told twice.
+    const targets = perToken(this.#options.targets())
     if (targets.length === 0) return
     const now = this.#now()
     if (!this.#admit(event, sessionId, now)) return
