@@ -15,7 +15,7 @@
 ## 它能做什么
 
 - **实时标签页，不是定时截图**：CDP `Page.startScreencast` 的帧经一条 WebSocket 送来，来一帧画一帧。标签页显示当前页面、URL 与标题，以及 agent 最近做了什么。
-- **十个 agent 工具**：`browser_navigate`、`browser_click`、`browser_type`、`browser_press`、`browser_scroll`、`browser_snapshot`、`browser_screenshot`、`browser_console`、`browser_network`、`browser_tabs`。
+- **十一个 agent 工具**：`browser_navigate`、`browser_click`、`browser_type`、`browser_press`、`browser_scroll`、`browser_snapshot`、`browser_screenshot`、`browser_console`、`browser_network`、`browser_tabs`、`browser_close`（只关本会话自己打开的标签页）。
 - **证据留在对话里**：每次 `browser_screenshot` 的结果都带图，于是对话记录保留的是 agent 真正看到的那一屏，而不只是一句转述。
 - **一个专用浏览器**：插件自己拉起 Chromium，用一次性 profile。它不会接管你已经登录的浏览器。
 - **能进这台机器自己的 GUI**：全新 profile 没有会话 cookie，本来只会看到 401 提示页。当导航落在 loopback 上的那页提示时，插件向宿主的连接服务要一条与 `dsh web` 启动时打印的同样的带票 URL，补一次。种下的 cookie 只活在这个一次性 profile 里，随它一起销毁。
