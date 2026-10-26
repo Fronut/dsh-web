@@ -6,7 +6,7 @@ import { DeviceRoster, ROSTER_VERSION } from '../src/core/devices.ts'
 import { OFFLINE_QUESTION_CLAIM_TTL_MS } from '../src/core/hub.ts'
 import { PushNotifier, type PushAddress, type PushNotification, type PushSendResult, type PushSender } from '../src/core/push.ts'
 import type { QuestionAnswer, UserQuestionRequestLike } from '../src/core/questions.ts'
-import { answerOf, makeBareHub, nextTurn, RecordingTransport, requestFrame, settle, type BareHubHarness } from './support/harness.ts'
+import { answerOf, makeBareHub, RecordingTransport, requestFrame, settle, type BareHubHarness } from './support/harness.ts'
 
 /**
  * Install the one timer kind these suites move.
@@ -56,6 +56,29 @@ function pushSink(answer: (target: PushAddress) => PushSendResult = () => ({ ok:
 }
 
 /**
+ * A roster that keeps every cleanup write the bridge starts without awaiting it.
+ *
+ * `removePush` is a file write and a claim decision must not wait on a disk, so the
+ * bridge calls it and moves on. A suite that has to see the table afterwards needs
+ * those promises themselves: the roster stays the real one, with its real file, and
+ * only the removals are remembered beside it.
+ */
+class CleanupRoster extends DeviceRoster {
+  readonly #removals: Promise<boolean>[] = []
+
+  /** @returns the removal each cleanup asked for, in the order the bridge asked. */
+  get removals(): readonly Promise<boolean>[] {
+    return this.#removals
+  }
+
+  override removePush(deviceToken: string): Promise<boolean> {
+    const removal = super.removePush(deviceToken)
+    this.#removals.push(removal)
+    return removal
+  }
+}
+
+/**
  * A real roster file holding one paired device per token, each registered for
  * notifications, read back into a `DeviceRoster`.
  *
@@ -65,7 +88,7 @@ function pushSink(answer: (target: PushAddress) => PushSendResult = () => ({ ok:
  * @param tokens - one APNs token per paired device, in roster order.
  * @returns the loaded roster.
  */
-async function rosterWith(tokens: readonly string[]): Promise<DeviceRoster> {
+async function rosterWith(tokens: readonly string[]): Promise<CleanupRoster> {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-remote-bridge-offline-'))
   const file = join(directory, 'remote-bridge', 'devices.json')
   await mkdir(dirname(file), { recursive: true })
@@ -81,14 +104,14 @@ async function rosterWith(tokens: readonly string[]): Promise<DeviceRoster> {
       push: { deviceToken, environment: 'sandbox', bundle: 'dev.dsh.Whale', registeredAt: 1_700_000_000_000 },
     })),
   }), 'utf8')
-  const roster = new DeviceRoster({ file })
+  const roster = new CleanupRoster({ file })
   await roster.load()
   return roster
 }
 
 /** What one offline-claim suite needs beyond the shared bare hub. */
 interface OfflineHarness extends BareHubHarness {
-  readonly roster: DeviceRoster
+  readonly roster: CleanupRoster
   readonly sink: PushSink
 }
 
@@ -162,11 +185,13 @@ function questionCards(transport: RecordingTransport): Record<string, unknown>[]
  * Wait for a roster cleanup the bridge starts without awaiting it.
  *
  * `removePush` is a file write and a claim decision must not wait on a disk, so
- * the suite yields event-loop turns — never durations — until the table holds the
- * expected number of registrations.
+ * each removal it asked for is awaited here instead. The dead tokens are dropped one
+ * write after another, and a turn count would time how long a loaded runner takes to
+ * flush two files rather than wait for the completion the assertion is about: the
+ * list is re-read after every wait, so the second removal's own write is awaited too.
  */
-async function untilRegistrations(roster: DeviceRoster, expected: number): Promise<void> {
-  for (let turn = 0; turn < 500 && roster.pushTargets().length !== expected; turn += 1) await nextTurn()
+async function untilRegistrations(roster: CleanupRoster, expected: number): Promise<void> {
+  for (let seen = 0; seen < roster.removals.length; seen += 1) await roster.removals[seen]?.catch(() => undefined)
   expect(roster.pushTargets()).toHaveLength(expected)
 }
 
