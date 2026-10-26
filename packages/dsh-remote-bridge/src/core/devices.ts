@@ -310,6 +310,31 @@ export class DeviceRoster {
     return false
   }
 
+  /**
+   * Forget one device's notification registration for a token APNs will never
+   * accept again.
+   *
+   * A dead alert token is the whole app install's refusal: the phone was restored,
+   * reinstalled, or the token belongs to another environment or bundle, so the
+   * Live Activity tokens that same install registered are dead by the same fact
+   * and go with it. The next `push.register` — which a live app performs on launch
+   * — writes a complete new block. The device itself stays paired: revoking a
+   * phone is a roster edit, never something a push refusal may do.
+   * @param deviceToken - the token APNs refused.
+   * @returns whether any row changed.
+   */
+  async removePush(deviceToken: string): Promise<boolean> {
+    for (const [hash, row] of this.#devices) {
+      const registration = row.push
+      if (registration === undefined || registration.deviceToken !== deviceToken) continue
+      const { tokenHash, deviceId, pubKey, fingerprint, createdAt, lastSeenAt } = row
+      this.#devices.set(hash, { tokenHash, deviceId, pubKey, fingerprint, createdAt, lastSeenAt })
+      await this.#persist()
+      return true
+    }
+    return false
+  }
+
   /** @returns every paired device that registered for notifications. */
   pushTargets(): readonly PushTargetView[] {
     const targets: PushTargetView[] = []
