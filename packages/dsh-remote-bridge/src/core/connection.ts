@@ -30,6 +30,7 @@ import type { PairingService } from './pairing.ts'
 import type { PushNotifier } from './push.ts'
 import { pushEventOfTurnEnd } from './push.ts'
 import type { ListedQuestion, QuestionAnswerItem, QuestionClaims, QuestionListPayload } from './questions.ts'
+import type { TurnEndQuietGate } from './turn-end-quiet.ts'
 import {
   CAP_AGENTS,
   CAP_COMMANDS,
@@ -240,6 +241,15 @@ export interface BridgeConnectionOptions {
    * (§28.3, §29).
    */
   readonly liveActivity?: LiveActivityNotifier
+  /**
+   * The gate a finished turn is announced through (§28, §29).
+   *
+   * Absent is a bridge assembled without one — a suite, or an embedder — and then
+   * both channels report at the frame, exactly as they did before the gate
+   * existed. The mount always hands one, because it is the only assembly that can
+   * read the host's own answer.
+   */
+  readonly turnEndQuiet?: TurnEndQuietGate
   /**
    * Called after a registration changed the device table.
    *
@@ -2441,10 +2451,10 @@ export class BridgeConnection {
         // know. The call returns before anything is sent and swallows its own
         // failures: the frame above is already gone, and a notification is not
         // worth a delayed or aborted stream (protocol §28.5).
-        if (delta.kind === 'turn-end') {
-          this.#options.push?.notify(pushEventOfTurnEnd(delta.reason), subscription.sessionId)
-          this.#options.liveActivity?.noteTurnEnd(subscription.sessionId, delta.reason)
-        }
+        if (delta.kind === 'turn-end') this.#announceTurnEnd(subscription.sessionId, delta.reason)
+        // An increment that is not a turn end is proof another turn is on: a held
+        // turn end for this session describes a turn the user has moved past.
+        else this.#options.turnEndQuiet?.noteTurnStarted(subscription.sessionId)
       }
     } catch (error) {
       if (!subscription.controller.signal.aborted) {
@@ -2453,6 +2463,24 @@ export class BridgeConnection {
     } finally {
       this.#forget(subscription)
     }
+  }
+
+  /**
+   * Hand one finished turn to the channel that announces it.
+   *
+   * The gate holds it until the session is quiet (§28, §29); a connection built
+   * without one has no host answer to wait for and reports at the frame.
+   * @param sessionId - the session the turn belonged to.
+   * @param reason - the host's own reason for ending it.
+   */
+  #announceTurnEnd(sessionId: string, reason: string): void {
+    const gate = this.#options.turnEndQuiet
+    if (gate !== undefined) {
+      gate.noteTurnEnd(sessionId, reason)
+      return
+    }
+    this.#options.push?.notify(pushEventOfTurnEnd(reason), sessionId)
+    this.#options.liveActivity?.noteTurnEnd(sessionId, reason)
   }
 
   /** Await a subscription's opening frame under a bounded wait. */

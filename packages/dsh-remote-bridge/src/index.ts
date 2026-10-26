@@ -51,6 +51,7 @@ import { PushNotifier } from './core/push.ts'
 import { QuestionClaims } from './core/questions.ts'
 import { WS_PATH } from './core/protocol.ts'
 import { SessionMeta, type SessionStoreFace, type SessionTitleFace, type WorkspacesFace } from './core/session-meta.ts'
+import { sessionQuietProbe, TURN_END_QUIET_MAX_MS, TurnEndQuietGate } from './core/turn-end-quiet.ts'
 import { SessionPermissions, type ApprovalPolicyFace, type PermissionPresetsFace, type SandboxPolicyFace } from './core/session-permissions.ts'
 import { selectionOf, modelSelectionOf } from './core/connection.ts'
 import { UsageService, type CredentialStoreFace, type SessionRosterFace, type SessionRouteFace, type SettingsFace } from './core/usage.ts'
@@ -90,6 +91,27 @@ export const OFFLINE_CLAIM_TTL_ENV = 'DSH_REMOTE_BRIDGE_OFFLINE_CLAIM_TTL_MS'
 export function offlineClaimTtl(env: NodeJS.ProcessEnv = process.env): number {
   const configured = Number(env[OFFLINE_CLAIM_TTL_ENV])
   return Number.isFinite(configured) && configured > 0 ? configured : OFFLINE_QUESTION_CLAIM_TTL_MS
+}
+
+/** The environment variable that moves how long a finished turn waits for its session to go quiet (§28). */
+export const TURN_END_QUIET_MAX_ENV = 'DSH_REMOTE_BRIDGE_TURN_END_QUIET_MAX_MS'
+
+/**
+ * The quiet-wait budget this process runs with.
+ *
+ * The budget is the bridge's own constant and never a host fact, so a deployment
+ * moves it here. A value that is missing, unreadable or not positive falls back to
+ * the constant instead of closing the window: a zero budget would announce every
+ * turn end at its frame, and an operator who wanted that would be turning push
+ * off. The budget only bounds the wait — a session that does fall quiet inside it
+ * is announced then, and one that does not is announced at the end with the
+ * reason it was still busy.
+ * @param env - the process environment, injectable for a suite.
+ * @returns the budget in milliseconds.
+ */
+export function turnEndQuietMaxWait(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number(env[TURN_END_QUIET_MAX_ENV])
+  return Number.isFinite(configured) && configured > 0 ? configured : TURN_END_QUIET_MAX_MS
 }
 
 /** This machine's IANA time zone, or undefined when the platform has none. */
@@ -390,6 +412,18 @@ function applyImpl(ctx: Context): void {
       return dropped
     },
   })
+  // The quiet gate both channels announce a finished turn through: §28's
+  // notification and §29's card end wait for the host's own answer that nothing is
+  // left running under that session — its own agent, any descendant, and any job
+  // the host attributes to either. Inert while no key is configured, because both
+  // channels are then off and no timer is worth arming.
+  const turnEndQuiet = new TurnEndQuietGate({
+    push,
+    liveActivity,
+    probe: sessionQuietProbe({ gateway: ctx.typertGateway, peer: ownerPeer, jobs }),
+    maxWaitMs: turnEndQuietMaxWait(),
+    log,
+  })
   // The bridge's own follow streams (§28/§29): a suspended phone has no socket,
   // so the turn end its card has to show would otherwise be seen by nobody. One
   // watcher per session that still holds a card token, armed from the roster and
@@ -408,6 +442,7 @@ function applyImpl(ctx: Context): void {
     peer: ownerPeer,
     sessions: watchedSessions,
     ...(apnsSender === undefined ? {} : { liveActivity, push }),
+    turnEndQuiet,
     log,
   })
   const permissions = new SessionPermissions(() => permissionFaces(ctx), log)
@@ -448,6 +483,7 @@ function applyImpl(ctx: Context): void {
     squads,
     push,
     liveActivity,
+    turnEndQuiet,
     offlineClaimTtlMs,
     onPushRegistered: () => { watchers.sync() },
     now: () => Date.now(),
@@ -480,6 +516,7 @@ function applyImpl(ctx: Context): void {
       disposeUpgrade()
       disposeRoute()
       watchers.dispose()
+      turnEndQuiet.dispose()
       hub.dispose()
       jobs.dispose()
     }

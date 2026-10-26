@@ -22,6 +22,7 @@ import { SessionPermissions } from '../../src/core/session-permissions.ts'
 import type { LiveActivityNotifier } from '../../src/core/liveactivity.ts'
 import type { PushNotifier } from '../../src/core/push.ts'
 import type { SquadTransport } from '../../src/core/squads.ts'
+import type { TurnEndQuietGate } from '../../src/core/turn-end-quiet.ts'
 import { UsageService, type UsageFaces } from '../../src/core/usage.ts'
 import type { BridgeGateway, GatewayInvokeRequest, GatewayPeer } from '../../src/core/wire.ts'
 
@@ -290,6 +291,8 @@ export interface HarnessOptions {
   readonly offlineClaimTtlMs?: number
   /** The lock-screen card path; the default models a bridge that sends no card. */
   readonly liveActivity?: LiveActivityNotifier
+  /** The gate a finished turn is announced through; the default reports at the frame. */
+  readonly turnEndQuiet?: TurnEndQuietGate
   /** The roster-change hook the standing watchers are armed from. */
   readonly onPushRegistered?: () => void
 }
@@ -386,6 +389,7 @@ export function makeConnection(options: HarnessOptions = {}): ConnectionHarness 
     ...(options.squads === undefined ? {} : { squads: options.squads }),
     ...(options.push === undefined ? {} : { push: options.push }),
     ...(options.liveActivity === undefined ? {} : { liveActivity: options.liveActivity }),
+    ...(options.turnEndQuiet === undefined ? {} : { turnEndQuiet: options.turnEndQuiet }),
     ...(options.onPushRegistered === undefined ? {} : { onPushRegistered: options.onPushRegistered }),
     now: () => Date.now(),
     clientTimeZone: () => 'Asia/Shanghai',
@@ -494,6 +498,7 @@ export function makeBareHub(options: HarnessOptions = {}): BareHubHarness {
     ...(options.squads === undefined ? {} : { squads: options.squads }),
     ...(options.push === undefined ? {} : { push: options.push }),
     ...(options.liveActivity === undefined ? {} : { liveActivity: options.liveActivity }),
+    ...(options.turnEndQuiet === undefined ? {} : { turnEndQuiet: options.turnEndQuiet }),
     ...(options.onPushRegistered === undefined ? {} : { onPushRegistered: options.onPushRegistered }),
     ...(options.offlineClaimTtlMs === undefined ? {} : { offlineClaimTtlMs: options.offlineClaimTtlMs }),
     now: () => Date.now(),
