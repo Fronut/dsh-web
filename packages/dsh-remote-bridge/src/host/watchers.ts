@@ -36,7 +36,7 @@
  * @module dsh-remote-bridge/host/watchers
  */
 
-import { SNAPSHOT_MAX_MESSAGES } from '../core/connection.ts'
+import { isTurnStartDelta, SNAPSHOT_MAX_MESSAGES } from '../core/connection.ts'
 import { deltaOfFollowFrame, MessageIndex, readFollowBaseline, SpawnCallIndex, ToolCallIndex } from '../core/dsh-frames.ts'
 import { failureText, withServiceUnavailableRetry } from '../core/gateway-errors.ts'
 import type { LiveActivityNotifier } from '../core/liveactivity.ts'
@@ -216,10 +216,11 @@ export class StandingWatchers {
         if (signal.aborted) break
         const delta = deltaOfFollowFrame(next.value, toolCalls, messages, memory)
         if (delta === undefined) continue
-        // An increment that is not a turn end is proof another turn is on: a turn
-        // end this watcher is still holding describes a turn the user moved past.
+        // Only an increment that proves this session's own work proves a new turn; a
+        // settled child, a usage count and a catalog change all arrive here without
+        // meaning the user prompted again.
         if (delta.kind !== 'turn-end') {
-          this.#options.turnEndQuiet?.noteTurnStarted(sessionId)
+          if (isTurnStartDelta(delta)) this.#options.turnEndQuiet?.noteTurnStarted(sessionId)
           continue
         }
         this.#turnEnded(sessionId, delta.reason)

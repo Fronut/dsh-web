@@ -16,6 +16,7 @@ import {
   sessionQuietProbe,
   type QuietAnswer,
 } from '../src/core/turn-end-quiet.ts'
+import { StandingWatchers } from '../src/host/watchers.ts'
 import { TURN_END_QUIET_MAX_ENV, turnEndQuietMaxWait } from '../src/index.ts'
 import { ControllableStream, FakeGateway, FakeJobRegistry, makeConnection, requestFrame, settle } from './support/harness.ts'
 
@@ -30,6 +31,11 @@ function record(type: string, seq: number, time: number, data: unknown): unknown
 /** One assistant-stream chunk frame. */
 function chunk(index: number, body: unknown): unknown {
   return { type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'a-1', revision: 1, index, time: 10 + index, chunk: body } }
+}
+
+/** One durable user message, in the shape its `source` decides the actor from. */
+function userMessage(id: string, source: Record<string, unknown>, text = 'child settled'): unknown {
+  return record('user/message', 13, 300, { id, turn: 1, content: [{ type: 'text', text }], source })
 }
 
 /** The baseline frame every follow stream opens with. */
@@ -445,6 +451,151 @@ describe('turn-end quiet gate: one answer to "is this session still working"', (
     expect(gate.held).toBe(0)
     expect(lines).toContain('turn-end dropped session=s-1 reason=new-turn')
     // And no announcement is made for the turn the user already left behind
+    advance(clock, TURN_END_QUIET_MAX_MS)
+    await settle()
+    expect(sink.notices).toHaveLength(0)
+    expect(sink.cards).toHaveLength(0)
+    gate.dispose()
+    harness.connection.dispose()
+  })
+
+  it('user is still told the turn ended when a settled child reports on the parent stream', async () => {
+    // Given a followed session whose turn end is held while its child is still running
+    const { clock } = useSuiteClock()
+    const sink = sinksAt(clock)
+    const gate = new TurnEndQuietGate({
+      push: sink.push,
+      liveActivity: sink.liveActivity,
+      probe: async () => ({ quiet: true }),
+      now: () => clock.now,
+    })
+    const harness = makeConnection({ paired: true, push: sink.push, liveActivity: sink.liveActivity, turnEndQuiet: gate })
+    const follow = new ControllableStream()
+    harness.gateway.follow = call => follow.attach(call.signal).iterable()
+    const pending = harness.connection.handleText(requestFrame(4, 'session.snapshot', { sessionId: 's-1' }))
+    follow.push(BASELINE)
+    await pending
+    follow.push(record('turn/end', 12, 201, { turn: 1, reason: { kind: 'completed' } }))
+    await settle()
+    expect(gate.held).toBe(1)
+    // When that child settles and the host pushes the notice of it onto the parent
+    follow.push(userMessage('m-settled', { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-9' }))
+    await settle()
+    // Then the held end survives, because a settled child is not a new turn
+    expect(gate.held).toBe(1)
+    // And it is announced once the session is quiet
+    advance(clock, TURN_END_QUIET_INTERVAL_MS)
+    await settle()
+    expect(sink.notices).toHaveLength(1)
+    expect(sink.notices[0]?.st).toBe('turn-end')
+    expect(sink.cards).toHaveLength(1)
+    expect(sink.cards[0]?.aps.event).toBe('end')
+    gate.dispose()
+    harness.connection.dispose()
+  })
+
+  it('user is still told the turn ended when the host publishes a usage count', async () => {
+    // Given a followed session whose turn end is held
+    const { clock } = useSuiteClock()
+    const sink = sinksAt(clock)
+    const gate = new TurnEndQuietGate({
+      push: sink.push,
+      liveActivity: sink.liveActivity,
+      probe: async () => ({ quiet: true }),
+      now: () => clock.now,
+    })
+    const harness = makeConnection({ paired: true, push: sink.push, liveActivity: sink.liveActivity, turnEndQuiet: gate })
+    const follow = new ControllableStream()
+    harness.gateway.follow = call => follow.attach(call.signal).iterable()
+    const pending = harness.connection.handleText(requestFrame(5, 'session.snapshot', { sessionId: 's-1' }))
+    follow.push(BASELINE)
+    await pending
+    follow.push(record('turn/end', 12, 201, { turn: 1, reason: { kind: 'completed' } }))
+    await settle()
+    expect(gate.held).toBe(1)
+    // When the finished assistant message delivers its usage count on the same stream
+    follow.push(record('assistant/message', 13, 202, { turn: 1, step: 1, content: [{ type: 'text', text: 'done' }], usage: { inputTokens: 10, outputTokens: 5 } }))
+    await settle()
+    // Then the held end survives, because a token count is not a new turn
+    expect(gate.held).toBe(1)
+    advance(clock, TURN_END_QUIET_INTERVAL_MS)
+    await settle()
+    expect(sink.notices).toHaveLength(1)
+    expect(sink.cards).toHaveLength(1)
+    gate.dispose()
+    harness.connection.dispose()
+  })
+
+  it('operator sees the card end survive the notice of a settled child', async () => {
+    // Given a standing watcher on a carded session, with its turn end held
+    const { clock } = useSuiteClock()
+    const sink = sinksAt(clock)
+    const gate = new TurnEndQuietGate({
+      push: sink.push,
+      liveActivity: sink.liveActivity,
+      probe: async () => ({ quiet: true }),
+      now: () => clock.now,
+    })
+    const gateway = new FakeGateway()
+    const stream = new ControllableStream()
+    gateway.follow = call => stream.attach(call.signal).iterable()
+    const watchers = new StandingWatchers({
+      gateway,
+      peer: createOwnerPeer(new Context()),
+      sessions: () => ['s-1'],
+      liveActivity: sink.liveActivity,
+      push: sink.push,
+      turnEndQuiet: gate,
+      log: () => undefined,
+    })
+    watchers.sync()
+    stream.push(BASELINE)
+    stream.push(record('turn/end', 12, 201, { turn: 1, reason: { kind: 'completed' } }))
+    await settle()
+    expect(gate.held).toBe(1)
+    // When the settled child's notice arrives on that same stream
+    stream.push(userMessage('m-settled', { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-9' }))
+    await settle()
+    // Then the held end survives the notice
+    expect(gate.held).toBe(1)
+    // And both surfaces report it once the session is quiet
+    advance(clock, TURN_END_QUIET_INTERVAL_MS)
+    await settle()
+    expect(sink.notices).toHaveLength(1)
+    expect(sink.cards).toHaveLength(1)
+    expect(sink.cards[0]?.aps.event).toBe('end')
+    watchers.dispose()
+    gate.dispose()
+  })
+
+  it('user prompting again from this stream is what drops the finished turn', async () => {
+    // Given a followed session whose turn end is held
+    const { clock } = useSuiteClock()
+    const sink = sinksAt(clock)
+    const lines: string[] = []
+    const gate = new TurnEndQuietGate({
+      push: sink.push,
+      liveActivity: sink.liveActivity,
+      probe: async () => ({ quiet: true }),
+      now: () => clock.now,
+      log: line => { lines.push(line) },
+    })
+    const harness = makeConnection({ paired: true, push: sink.push, liveActivity: sink.liveActivity, turnEndQuiet: gate })
+    const follow = new ControllableStream()
+    harness.gateway.follow = call => follow.attach(call.signal).iterable()
+    const pending = harness.connection.handleText(requestFrame(6, 'session.snapshot', { sessionId: 's-1' }))
+    follow.push(BASELINE)
+    await pending
+    follow.push(record('turn/end', 12, 201, { turn: 1, reason: { kind: 'completed' } }))
+    await settle()
+    expect(gate.held).toBe(1)
+    // When this session's own user prompts again
+    follow.push(userMessage('m-human', { kind: 'user' }, 'one more thing'))
+    await settle()
+    // Then the held end is dropped, and the line says why
+    expect(gate.held).toBe(0)
+    expect(lines).toContain('turn-end dropped session=s-1 reason=new-turn')
+    // And nothing is announced for the turn the user already left behind
     advance(clock, TURN_END_QUIET_MAX_MS)
     await settle()
     expect(sink.notices).toHaveLength(0)

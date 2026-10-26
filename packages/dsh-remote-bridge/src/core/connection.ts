@@ -267,6 +267,39 @@ export interface ConnectionAuth {
   readonly deviceId: string
 }
 
+/**
+ * Whether one follow increment proves its session is working again.
+ *
+ * Deliberately narrow, and never "anything that is not a turn end": a parent's
+ * stream also carries a settled child's message (`source.kind` `subagent-settled`
+ * or `agent-message`, which the frames read as an agent actor), the usage count the
+ * host publishes as an assistant message finishes, and the catalog changes of the
+ * threads that session spawned. Reading any of those as a new turn would drop the
+ * turn end a waiting phone has not been told about yet — the one whose session is
+ * still busy with a running child, which is the case §28's gate exists for.
+ *
+ * One shared rule on purpose: this connection's own drain and the standing watchers
+ * both read it, so the two paths cannot disagree about what a new turn looks like.
+ * @param delta - one increment of a follow stream.
+ * @returns whether assistant work is streaming, or this session's own user wrote.
+ */
+export function isTurnStartDelta(delta: { readonly kind: string; readonly actor?: { readonly kind?: string } }): boolean {
+  switch (delta.kind) {
+    case 'text':
+    case 'reasoning':
+    case 'tool-call':
+    case 'tool-result':
+      return true
+    case 'user-message':
+      // A message with no actor is not evidence: a durable log written before
+      // sources existed carries none, and guessing "human" there would drop a real
+      // announcement.
+      return delta.actor?.kind === 'human'
+    default:
+      return false
+  }
+}
+
 /** The answer of a subscription's opening frame: a baseline, or why there is none. */
 type Opening = { readonly ok: true; readonly baseline: FollowBaseline } | { readonly ok: false; readonly code: string; readonly msg: string }
 
@@ -2452,9 +2485,10 @@ export class BridgeConnection {
         // failures: the frame above is already gone, and a notification is not
         // worth a delayed or aborted stream (protocol §28.5).
         if (delta.kind === 'turn-end') this.#announceTurnEnd(subscription.sessionId, delta.reason)
-        // An increment that is not a turn end is proof another turn is on: a held
-        // turn end for this session describes a turn the user has moved past.
-        else this.#options.turnEndQuiet?.noteTurnStarted(subscription.sessionId)
+        // Only an increment that proves this session's own work proves a new turn; a
+        // settled child, a usage count and a catalog change all arrive here without
+        // meaning the user prompted again.
+        else if (isTurnStartDelta(delta)) this.#options.turnEndQuiet?.noteTurnStarted(subscription.sessionId)
       }
     } catch (error) {
       if (!subscription.controller.signal.aborted) {
